@@ -1,21 +1,22 @@
-# PRD: CMC for Agents (a simple, fast API on top of CoinMarketCap data)
+# PRD: CoinStack — altcoin discovery for AI agents
 
 Sep 29, 2026 · product name: **CoinStack**
 
 ## 1. Overview
 
-**CMC for Agents is a small REST API that gives AI agents the market data they need through a handful of plainly named endpoints, so an agent never has to learn CoinMarketCap's many endpoints, IDs, credit costs or error codes.** It is built on the CMC API for the "Build with CMC: API Hackathon", in the AI Agents and Automation track, and written in Go so one lightweight service can serve many agents at once.
+**CoinStack is an altcoin-discovery API for AI agents: it finds early, high-upside altcoins and returns each with a transparent composite score, the signal breakdown behind it, risk flags and plain-English reasons.** Built on the CoinMarketCap API for the "Build with CMC: API Hackathon" (AI Agents and Automation track), written in Go so one lightweight service can serve many agents at once — plus an optional Telegram bot on the same discovery engine.
 
-**Problem.** CMC's API is broad. To answer "what is SOL trading at?" an agent has to pick the right endpoint, turn a ticker into a CMC ID (and avoid duplicate tickers), request the right fields, parse a deeply nested response, and handle credit limits and rate limits. Agents waste tokens and make mistakes on every one of those steps, and a naive setup spends CMC credits on every agent call.
+**Problem.** Finding early-stage movers on CMC means hand-combining listings, rank history, volumes and tags across many endpoints, while credits and rate limits punish naive polling. Agents need one call that answers "what looks early and strong right now, and why".
 
-**Solution.** A thin layer between agents and CMC:
+**Solution.** A discovery layer between agents and CMC:
 
-- Five simple endpoints with plain names and one flat JSON shape.
-- Ticker and name resolution done for the agent, with a clear error when a ticker is ambiguous.
-- Responses served from a cache that a background poller keeps fresh, so replies take milliseconds and agent traffic does not consume CMC credits.
-- An OpenAPI spec so any agent framework can read the API and call it directly.
+- Seven read endpoints (`gems`, `screen`, `climbers`, `new-listings`, `sectors`, `asset`, `resolve`) with one flat JSON shape.
+- A transparent composite score (0–100): turnover 0.30, rank climb 0.30, new listing 0.20, sector heat 0.20 — plus confidence, risk flags and reasons.
+- A background poller keeps a tiered top-N snapshot and a 7-day hourly history, so answers take milliseconds and agent traffic spends no CMC credits.
+- A Telegram bot for alerts and ad-hoc queries, built on the same engine.
+- An OpenAPI spec so any agent framework can call it directly.
 
-**One-line pitch.** "CMC data, shaped for agents: five endpoints, one JSON shape, answers in milliseconds."
+**One-line pitch.** "Find early, high-upside altcoins with a transparent score — one call, one JSON shape, answers in milliseconds."
 
 ## 2. Goals, non-goals and success metrics
 
@@ -64,14 +65,15 @@ See [api-contract.md](api-contract.md) for the exact wire contract.
 
 | ID | Endpoint | What it answers | Priority |
 | --- | --- | --- | --- |
-| A1 | `/v1/price` | Current price and basics for one or more assets | P0 |
-| A2 | `/v1/asset` | One asset in more detail: rank, supply, tags, listing date, 1h/24h/7d change | P0 |
-| A3 | `/v1/compare` | Two to five assets side by side on the same fields | P1 |
-| A4 | `/v1/movers` | Top gainers or losers over a window | P0 |
-| A5 | `/v1/new-tokens` | Recently listed assets | P1 |
-| A6 | `/v1/resolve` | Turns a symbol or name into candidate CMC assets | P1 |
-| A7 | `/v1/openapi.json` | The OpenAPI spec for the API | P0 |
-| A8 | `/v1/health` | Last successful CMC poll, cache size, credits used today | P0 |
+| A1 | `/v1/gems` | Scored altcoin candidates with signals, risk flags and reasons | P0 |
+| A2 | `/v1/screen` | Filter the universe by cap, volume, turnover, changes, tags, age | P0 |
+| A3 | `/v1/climbers` | Biggest rank gains/drops over 24h or 7d from retained history | P0 |
+| A4 | `/v1/new-listings` | Recently listed assets | P0 |
+| A5 | `/v1/sectors` | Tag aggregates ranked by heat; one sector's members | P1 |
+| A6 | `/v1/asset` | One asset in detail plus its signal breakdown | P0 |
+| A7 | `/v1/resolve` | Turns a symbol or name into candidate CMC assets | P1 |
+| A8 | `/v1/openapi.json` | The OpenAPI spec for the API | P0 |
+| A9 | `/v1/health` | Poller status, cache and history depth, credit usage | P0 |
 
 **Design rules**
 
@@ -85,19 +87,20 @@ See [api-contract.md](api-contract.md) for the exact wire contract.
 
 | Used for | CMC endpoint | Notes |
 | --- | --- | --- |
-| Price, volume, market cap, changes for the top assets, and movers | `/v1/cryptocurrency/listings/latest` | The poller reads the top N by market cap every cycle |
+| Price, volume, market cap, changes for the top assets | `/v1/cryptocurrency/listings/latest` | Tiered poll: fast tier every PollInterval, the rest every SlowInterval |
 | Assets outside the top N, fetched on demand | `/v2/cryptocurrency/quotes/latest` by ID | Short cache; identical simultaneous requests share one call |
 | Ticker and name resolution | `/v1/cryptocurrency/map` | Cached and refreshed daily |
 | Detail: tags, listing date, supply | `/v2/cryptocurrency/info` | Cached for a day |
 | New listings | `/v1/cryptocurrency/listings/new` | Fallback: recent `first_historical_data` in the map |
+| Credit usage | `/v1/key/info` | Read periodically to reconcile local counts |
 
-- A background poller refreshes the top N assets (N = 500) every 60 seconds. Agents read from memory, never straight from CMC for common assets.
-- Movers, compare and price for top assets are computed from that cache with no extra CMC calls.
-- For an asset outside the top N, the API fetches it once and caches it for 60 seconds, coalescing identical concurrent requests.
+- The poller covers the top N (default 3000) in two tiers: ranks 1..FastN every PollInterval (default 2m), the rest every SlowInterval (default 15m). Agents read from memory.
+- Every published snapshot feeds a per-asset hourly history ring kept for 7 days; `rank_climb` and turnover-surge signals, `/v1/climbers` and `rank_change_since_first_seen` read from it.
+- For an asset outside the top N, the API fetches it once and caches it, coalescing identical concurrent requests.
 - Every cached record keeps CMC's `last_updated` and the fetch time, so `age_seconds` is always exact.
 - If CMC fails, the API keeps serving the last good data with its real age and a `stale_data` warning, up to a set limit, then returns `upstream_unavailable`.
 
-Credit budget: `calls_per_day = 1440 × ⌈N / P⌉`. Keep projected use under ~70 % of the plan's monthly credits; otherwise lower N, then slow the cycle for lower-ranked assets.
+Credit budget: `credits_per_day ≈ ⌈FastN/200⌉·(86400/Poll) + ⌈(TopN−FastN)/200⌉·(86400/Slow) + 50` overhead. Presets (`COINSTACK_PRESET`): **free** TopN 1000 / ~390 day, **startup** (default) TopN 3000 / ~2.1k day, **standard** TopN 5000 / ~7.7k day. `/v1/health` reports `projected_credits_per_day` and actual usage; keep the projection under ~70 % of the plan's monthly credits.
 
 ## 6. Architecture in Go
 
@@ -106,8 +109,11 @@ Credit budget: `calls_per_day = 1440 × ⌈N / P⌉`. Keep projected use under ~
 | Poller | One goroutine with a ticker; parallel page fetches with a small worker pool; rate limiter |
 | Resolver index | Built from the CMC map; read-only after build, lock-free lookups |
 | Cache | Copy-on-write snapshot in an `atomic.Pointer` |
-| On-demand fetcher | `singleflight`; 60-second cache |
-| HTTP handlers | `net/http` with chi |
+| History ring | Per-asset hourly `model.Sample`, 7-day window; rebuilt at startup via `DISTINCT ON (cmc_id, hour)` over persisted snapshots |
+| Signals | Pure functions in `internal/signals`; `internal/discover` engine shared by API and bot |
+| On-demand fetcher | `singleflight`; short-lived cache |
+| HTTP handlers | `net/http` with chi; openapi.json generated from the same param table handlers validate |
+| Telegram bot | `internal/telegram`, plain Bot API; alerts via `Market.Subscribe`, digest at a fixed UTC hour |
 | Writer | Buffered channel plus one goroutine writing batches to Neon |
 | Health and metrics | In-memory counters exposed on `/v1/health` |
 

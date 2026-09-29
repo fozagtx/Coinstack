@@ -14,12 +14,12 @@ import (
 type paramKind int
 
 const (
-	kindString   paramKind = iota // free text
-	kindList                      // comma-separated asset queries; min/max bound the item count
-	kindInt                       // integer; min/max bound the value
-	kindNumber                    // finite number; min bounds the value
-	kindEnum                      // one of enum, case-insensitive
-	kindCurrency                  // fiat code, validated against Market.Currencies
+	kindString paramKind = iota // free text
+	kindList                    // comma-separated asset queries; min/max bound the item count
+	kindInt                     // integer; min/max bound the value
+	kindNumber                  // finite number; min bounds the value
+	kindEnum                    // one of enum, case-insensitive
+	kindBool                    // true/false/1/0
 )
 
 // paramSpec describes one query parameter an endpoint accepts. The same
@@ -36,38 +36,65 @@ type paramSpec struct {
 }
 
 var (
-	paramCurrency = paramSpec{name: "currency", kind: kindCurrency, def: "USD", maxLen: 10}
-	paramLimit50  = paramSpec{name: "limit", kind: kindInt, def: "10", min: 1, max: 50, maxLen: 10}
+	paramLimit50 = paramSpec{name: "limit", kind: kindInt, def: "10", min: 1, max: 50, maxLen: 10}
+	// optionalNumber is an unbounded numeric filter; the empty default
+	// marks it as not provided, which the handler checks with present.
+	optionalNumber = func(name string) paramSpec {
+		return paramSpec{name: name, kind: kindNumber, def: "", min: -math.MaxFloat64, maxLen: 30}
+	}
 )
 
 // endpointParams lists the query parameters each route accepts. Anything
 // else is rejected with 400 invalid_parameter.
 var endpointParams = map[string][]paramSpec{
-	pathPrice: {
-		{name: "asset", kind: kindList, required: true, min: 1, max: 20, maxLen: 2000},
-		paramCurrency,
+	pathGems: {
+		{name: "max_market_cap", kind: kindNumber, def: "50000000", min: 0, maxLen: 30},
+		{name: "min_market_cap", kind: kindNumber, def: "1000000", min: 0, maxLen: 30},
+		{name: "min_volume", kind: kindNumber, def: "100000", min: 0, maxLen: 30},
+		{name: "listed_within_days", kind: kindInt, def: "0", min: 0, max: 365, maxLen: 10},
+		{name: "sector", kind: kindString, maxLen: 60},
+		{name: "include_pumped", kind: kindBool, def: "false", maxLen: 10},
+		paramLimit50,
 	},
-	pathAsset: {
-		{name: "asset", kind: kindList, required: true, min: 1, max: 1, maxLen: 100},
-		paramCurrency,
+	pathScreen: {
+		optionalNumber("min_market_cap"),
+		optionalNumber("max_market_cap"),
+		optionalNumber("min_volume"),
+		optionalNumber("max_volume"),
+		optionalNumber("min_turnover"),
+		optionalNumber("min_change_1h_pct"),
+		optionalNumber("max_change_1h_pct"),
+		optionalNumber("min_change_24h_pct"),
+		optionalNumber("max_change_24h_pct"),
+		optionalNumber("min_change_7d_pct"),
+		optionalNumber("max_change_7d_pct"),
+		{name: "tag", kind: kindString, maxLen: 300},
+		{name: "listed_within_days", kind: kindInt, def: "0", min: 0, max: 365, maxLen: 10},
+		{name: "exclude_stablecoins", kind: kindBool, def: "true", maxLen: 10},
+		{name: "sort", kind: kindEnum, def: "change_24h_pct", enum: []string{"change_1h_pct", "change_24h_pct", "change_7d_pct", "volume_24h", "market_cap", "turnover", "rank"}, maxLen: 30},
+		{name: "order", kind: kindEnum, def: "", enum: []string{"asc", "desc"}, maxLen: 10},
+		paramLimit50,
 	},
-	pathCompare: {
-		{name: "assets", kind: kindList, required: true, min: 2, max: 5, maxLen: 500},
-		paramCurrency,
-	},
-	pathMovers: {
-		{name: "window", kind: kindEnum, def: "24h", enum: []string{"1h", "24h", "7d"}, maxLen: 10},
+	pathClimbers: {
+		{name: "window", kind: kindEnum, def: "24h", enum: []string{"24h", "7d"}, maxLen: 10},
 		{name: "direction", kind: kindEnum, def: "up", enum: []string{"up", "down"}, maxLen: 10},
 		{name: "min_volume", kind: kindNumber, def: "100000", min: 0, maxLen: 30},
-		{name: "min_market_cap", kind: kindNumber, def: "0", min: 0, maxLen: 30},
+		{name: "max_market_cap", kind: kindNumber, def: "0", min: 0, maxLen: 30},
 		paramLimit50,
-		paramCurrency,
 	},
-	pathNewTokens: {
+	pathNewListings: {
 		{name: "days", kind: kindInt, def: "7", min: 1, max: 30, maxLen: 10},
 		{name: "min_volume", kind: kindNumber, def: "0", min: 0, maxLen: 30},
 		paramLimit50,
-		paramCurrency,
+	},
+	pathSectors: {
+		{name: "sort", kind: kindEnum, def: "heat", enum: []string{"heat", "change_24h_pct", "change_7d_pct", "volume_24h", "market_cap"}, maxLen: 30},
+		{name: "min_members", kind: kindInt, def: "5", min: 2, max: 200, maxLen: 10},
+		{name: "sector", kind: kindString, maxLen: 60},
+		paramLimit50,
+	},
+	pathAsset: {
+		{name: "asset", kind: kindString, required: true, maxLen: 100},
 	},
 	pathResolve: {
 		{name: "query", kind: kindString, required: true, maxLen: 100},
@@ -215,6 +242,42 @@ func (q *queryParams) enum(name string) (string, *apiError) {
 			fmt.Sprintf("Retry with one of allowed_values, or omit %s for the default %s.", name, spec.def), spec.enum)
 	}
 	return lv, nil
+}
+
+// present reports whether the parameter was sent with a non-empty value.
+func (q *queryParams) present(name string) bool {
+	v, _ := q.value(name)
+	return v != ""
+}
+
+// optNumber returns an optional numeric parameter: ok is false when it
+// was not provided.
+func (q *queryParams) optNumber(name string) (float64, bool, *apiError) {
+	if !q.present(name) {
+		return 0, false, nil
+	}
+	v, err := q.number(name)
+	if err != nil {
+		return 0, false, err
+	}
+	return v, true, nil
+}
+
+// boolean returns a bool parameter: true, false, 1 or 0.
+func (q *queryParams) boolean(name string) (bool, *apiError) {
+	v, spec := q.value(name)
+	if v == "" {
+		v = spec.def
+	}
+	switch strings.ToLower(v) {
+	case "true", "1", "yes":
+		return true, nil
+	case "false", "0", "no":
+		return false, nil
+	}
+	return false, invalidParam(name,
+		fmt.Sprintf("%s must be true or false; got %q.", name, truncate(v, 30)),
+		fmt.Sprintf("Retry with %s=true or %s=false, or omit it for the default %s.", name, name, spec.def), nil)
 }
 
 // list returns a comma-separated list: entries trimmed, empties dropped and

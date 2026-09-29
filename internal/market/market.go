@@ -2,7 +2,7 @@
 // refreshes the top-N snapshot from CoinMarketCap in tiers, while on-demand
 // lookups fetch (and briefly cache) assets outside it, coalescing identical
 // concurrent requests and spending a bounded credit budget. Smaller loops
-// keep the resolver map, new listings, fiat rates and credit usage current.
+// keep the resolver map, new listings and credit usage current.
 package market
 
 import (
@@ -18,7 +18,6 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
-	"github.com/fozagtx/coinstack/internal/cache"
 	"github.com/fozagtx/coinstack/internal/cmc"
 	"github.com/fozagtx/coinstack/internal/model"
 )
@@ -80,14 +79,18 @@ type Config struct {
 	SeedMap []model.MapEntry
 	// NewListingsRefresh is the new-listings refresh interval; default 10m.
 	NewListingsRefresh time.Duration
-	// FXRefresh is the fiat-rate refresh interval; default 15m.
-	FXRefresh time.Duration
-	// Currencies are the fiat currencies to convert to besides USD;
-	// default EUR, GBP, JPY. A non-nil empty slice disables fiat rates.
-	Currencies []string
 	// KeyInfoRefresh is the interval for reading CMC's own credit usage;
 	// default 5m.
 	KeyInfoRefresh time.Duration
+	// HistoryWindow is how long per-asset history samples are kept;
+	// default 7 days.
+	HistoryWindow time.Duration
+	// HistoryBucket is the minimum spacing between retained history
+	// samples per asset; default 1h.
+	HistoryBucket time.Duration
+	// ProjectedCreditsPerDay is the configured schedule's projected daily
+	// CMC credit burn, echoed in Status; informational only.
+	ProjectedCreditsPerDay int
 	// Now returns the current time; default time.Now. For tests.
 	Now func() time.Time
 	// Logger receives the market's logs; default slog.Default().
@@ -130,21 +133,9 @@ func (c *Config) setDefaults() {
 	setDuration(&c.InfoTTL, 24*time.Hour)
 	setDuration(&c.MapRefresh, 24*time.Hour)
 	setDuration(&c.NewListingsRefresh, 10*time.Minute)
-	setDuration(&c.FXRefresh, 15*time.Minute)
 	setDuration(&c.KeyInfoRefresh, 5*time.Minute)
-	if c.Currencies == nil {
-		c.Currencies = []string{"EUR", "GBP", "JPY"}
-	}
-	seen := map[string]bool{"USD": true, "": true}
-	currencies := make([]string, 0, len(c.Currencies))
-	for _, cur := range c.Currencies {
-		cur = model.NormalizeCurrency(cur)
-		if !seen[cur] {
-			seen[cur] = true
-			currencies = append(currencies, cur)
-		}
-	}
-	c.Currencies = currencies
+	setDuration(&c.HistoryWindow, 7*24*time.Hour)
+	setDuration(&c.HistoryBucket, time.Hour)
 	if c.Now == nil {
 		c.Now = time.Now
 	}
@@ -166,15 +157,17 @@ type Market struct {
 	cfg   Config
 	log   *slog.Logger
 	now   func() time.Time
-	store cache.Store
+	store Store
 
 	pollMu sync.Mutex // serializes top-N polls; no reader ever waits on it
 
 	// mu guards the fields below. It is only held briefly and never across
 	// an upstream call.
+	history       map[int64][]model.Sample
 	mu            sync.Mutex
 	pages         []page
 	orphans       map[int64]orphan
+	subs          []*sub
 	published     bool // the poller has published at least once
 	lastPollAt    time.Time
 	lastSuccessAt time.Time
@@ -189,7 +182,6 @@ type Market struct {
 	calls      atomic.Int64
 	callErrors atomic.Int64
 	credits    credits
-	fx         atomic.Pointer[map[string]fxRate]
 
 	quoteSrc *source[model.Quote]
 	infoSrc  *source[model.Info]
@@ -209,6 +201,7 @@ func New(up cmc.Upstream, cfg Config) *Market {
 		now:          cfg.Now,
 		pages:        buildPages(cfg),
 		orphans:      make(map[int64]orphan),
+		history:      make(map[int64][]model.Sample),
 		mapEntries:   cfg.SeedMap,
 		mapFetchedAt: cfg.LastMapFetch,
 		budget:       newBudget(cfg.OnDemandBudgetPerMinute, cfg.OnDemandBudgetPerDay),
@@ -259,13 +252,61 @@ func (m *Market) Run(ctx context.Context) error {
 	start(m.pollLoop)
 	start(m.mapLoop)
 	start(m.newListingsLoop)
-	if len(m.cfg.Currencies) > 0 {
-		start(func(ctx context.Context) { every(ctx, m.cfg.FXRefresh, m.refreshFX) })
-	}
 	start(func(ctx context.Context) { every(ctx, m.cfg.KeyInfoRefresh, m.refreshKeyInfo) })
 	start(func(ctx context.Context) { every(ctx, sweepInterval, m.sweep) })
 	wg.Wait()
 	return nil
+}
+
+// Subscribe registers fn to be called with every newly published
+// snapshot (polls and Seed). fn never blocks the poller: each subscriber
+// runs on its own goroutine and a snapshot published while fn is still
+// working replaces the pending one rather than queueing.
+func (m *Market) Subscribe(fn func(*Snapshot)) {
+	m.mu.Lock()
+	m.subs = append(m.subs, &sub{fn: fn})
+	m.mu.Unlock()
+}
+
+// notifySubsLocked delivers snap to every subscriber. Caller must hold
+// m.mu; delivery itself is non-blocking.
+func (m *Market) notifySubsLocked(snap *Snapshot) {
+	for _, s := range m.subs {
+		s.notify(snap)
+	}
+}
+
+// sub is one snapshot subscriber with coalescing delivery.
+type sub struct {
+	mu      sync.Mutex
+	running bool
+	pending *Snapshot
+	fn      func(*Snapshot)
+}
+
+func (s *sub) notify(snap *Snapshot) {
+	s.mu.Lock()
+	s.pending = snap
+	if s.running {
+		s.mu.Unlock()
+		return
+	}
+	s.running = true
+	s.mu.Unlock()
+	go func() {
+		for {
+			s.mu.Lock()
+			p := s.pending
+			s.pending = nil
+			if p == nil {
+				s.running = false
+				s.mu.Unlock()
+				return
+			}
+			s.mu.Unlock()
+			s.fn(p)
+		}
+	}()
 }
 
 func (m *Market) pollLoop(ctx context.Context) {
@@ -313,7 +354,7 @@ func sleep(ctx context.Context, d time.Duration) bool {
 }
 
 // Snapshot returns the latest published top-N snapshot; never nil.
-func (m *Market) Snapshot() *cache.Snapshot { return m.store.Load() }
+func (m *Market) Snapshot() *Snapshot { return m.store.Load() }
 
 // Ready reports whether a non-empty snapshot has been published (by a poll
 // or by Seed).
@@ -328,12 +369,14 @@ func (m *Market) Status() model.MarketStatus {
 		LastError:     m.lastError,
 		MapFetchedAt:  m.mapFetchedAt,
 	}
+	st.HistoryAssets, st.HistoryHours = m.historyStatsLocked()
 	m.mu.Unlock()
 	st.CacheSize = m.store.Load().Len()
 	st.OnDemandCacheSize = m.quoteSrc.cache.size()
 	st.TopN = m.cfg.TopN
 	st.PollInterval = m.cfg.PollInterval
 	st.CreditsUsedToday, st.CreditsUsedMonth, st.CreditLimitMonthly = m.credits.usage(m.now())
+	st.ProjectedCreditsPerDay = m.cfg.ProjectedCreditsPerDay
 	st.UpstreamCalls = m.calls.Load()
 	st.UpstreamErrors = m.callErrors.Load()
 	return st

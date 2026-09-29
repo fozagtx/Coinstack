@@ -25,13 +25,18 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"bufio"
+	"strings"
+
 	"github.com/fozagtx/coinstack/internal/api"
 	"github.com/fozagtx/coinstack/internal/cmc"
 	"github.com/fozagtx/coinstack/internal/config"
+	"github.com/fozagtx/coinstack/internal/discover"
 	"github.com/fozagtx/coinstack/internal/market"
 	"github.com/fozagtx/coinstack/internal/model"
 	"github.com/fozagtx/coinstack/internal/resolve"
 	"github.com/fozagtx/coinstack/internal/store"
+	"github.com/fozagtx/coinstack/internal/telegram"
 )
 
 var version = "dev"
@@ -44,6 +49,7 @@ func main() {
 }
 
 func run(args []string, out io.Writer) error {
+	loadDotEnv(".env")
 	cmd := "serve"
 	if len(args) > 0 {
 		cmd, args = args[0], args[1:]
@@ -133,7 +139,7 @@ func serve() error {
 		SlowInterval:            cfg.SlowInterval,
 		OnDemandBudgetPerMinute: cfg.OnDemandPerMin,
 		OnDemandBudgetPerDay:    cfg.OnDemandPerDay,
-		Currencies:              cfg.Currencies,
+		ProjectedCreditsPerDay:  cfg.ProjectedCreditsPerDay(),
 		LastMapFetch:            mapFetchedAt,
 		SeedMap:                 seedMap,
 		Logger:                  logger,
@@ -167,6 +173,16 @@ func serve() error {
 			mk.Seed(quotes)
 			logger.Info("snapshot restored from database", "assets", len(quotes))
 		}
+
+		loadCtx2, cancel2 := context.WithTimeout(ctx, 30*time.Second)
+		hist, err := st.LoadHistory(loadCtx2, 7*24*time.Hour)
+		cancel2()
+		if err != nil {
+			logger.Warn("could not reload history", "err", err)
+		} else if len(hist) > 0 {
+			mk.SeedHistory(hist)
+			logger.Info("history restored from database", "assets", len(hist))
+		}
 	}
 
 	var dbk dbKeys
@@ -174,6 +190,22 @@ func serve() error {
 	if st != nil {
 		dbk, reqlog = st, st
 	}
+	engine := discover.New(mk, resolver, nil)
+
+	var bot *telegram.Bot
+	if cfg.TelegramToken != "" {
+		bot = telegram.New(telegram.Options{
+			Token:      cfg.TelegramToken,
+			ChatIDs:    cfg.TelegramChatIDs,
+			DigestHour: cfg.TelegramDigestHour,
+			Alerts:     cfg.TelegramAlerts,
+			Engine:     engine,
+			Subscribe:  mk.Subscribe,
+			Logger:     logger,
+		})
+		logger.Info("telegram bot enabled", "chats", len(cfg.TelegramChatIDs), "alerts", cfg.TelegramAlerts)
+	}
+
 	keys := newKeyChain(cfg.StaticKeys, dbk)
 	srv := api.New(api.Config{
 		Version:          version,
@@ -181,8 +213,16 @@ func serve() error {
 		StaleAfter:       cfg.StaleAfter,
 		MaxStale:         cfg.MaxStale,
 		TopN:             cfg.TopN,
+		Preset:           cfg.Preset,
 		AuthDisabled:     !cfg.AuthEnabled,
 		Logger:           logger,
+		Telegram: func() api.TelegramStatus {
+			if bot == nil {
+				return api.TelegramStatus{}
+			}
+			en, chats, last, sent := bot.Status()
+			return api.TelegramStatus{Enabled: en, Chats: chats, LastUpdateAt: last, AlertsSent: sent}
+		},
 	}, mk, resolver, keys, reqlog)
 	if !cfg.AuthEnabled {
 		logger.Warn("COINSTACK_AUTH=off: every endpoint is public; use only for local development")
@@ -197,6 +237,13 @@ func serve() error {
 			logger.Error("market poller stopped", "err", err)
 		}
 	}()
+	if bot != nil {
+		go func() {
+			if err := bot.Run(marketCtx); err != nil {
+				logger.Error("telegram bot stopped", "err", err)
+			}
+		}()
+	}
 
 	httpSrv := &http.Server{
 		Addr:              net.JoinHostPort("", cfg.Port),
@@ -210,7 +257,8 @@ func serve() error {
 	serveErr := make(chan error, 1)
 	go func() {
 		logger.Info("coinstack listening", "addr", httpSrv.Addr, "version", version, "upstream", cfg.CMCBaseURL,
-			"top_n", cfg.TopN, "poll_interval", cfg.PollInterval.String(), "database", st != nil)
+			"top_n", cfg.TopN, "poll_interval", cfg.PollInterval.String(), "database", st != nil,
+			"projected_credits_per_day", cfg.ProjectedCreditsPerDay())
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 		}
@@ -336,4 +384,43 @@ func rateLabel(n int) string {
 		return "default"
 	}
 	return strconv.Itoa(n) + "/min"
+}
+
+// loadDotEnv reads KEY=VALUE lines from path into the environment, without
+// overriding variables that are already set. Blank lines and comments are
+// skipped; values may be single- or double-quoted. Missing file is fine.
+func loadDotEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	var lines []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		if len(val) >= 2 && (val[0] == '"' && val[len(val)-1] == '"' || val[0] == '\'' && val[len(val)-1] == '\'') {
+			val = val[1 : len(val)-1]
+		} else if i := strings.Index(val, " #"); i >= 0 {
+			val = strings.TrimSpace(val[:i])
+		} else if strings.HasPrefix(val, "#") {
+			val = ""
+		}
+		if key == "" || os.Getenv(key) != "" {
+			continue
+		}
+		_ = os.Setenv(key, val)
+	}
 }

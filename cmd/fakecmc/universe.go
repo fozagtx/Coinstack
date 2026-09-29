@@ -1,4 +1,4 @@
-package cmcfake
+package main
 
 import (
 	"fmt"
@@ -91,6 +91,7 @@ type coin struct {
 	maxSupply    float64 // 0 when uncapped or unknown
 	infinite     bool
 	ranked       bool
+	synthetic    bool
 	pairs        int
 }
 
@@ -110,6 +111,10 @@ type sim struct {
 	sigma      float64 // log-price volatility per tick
 	stable     bool
 	peg        *sim // bridged clones follow the price of the asset they wrap
+	pegRatio   float64
+	runner     bool
+	runRate    float64 // runners multiply mcap/volume by exp(runRate*hour)
+	phase      float64 // per-asset wave offset for time drift
 }
 
 type realAsset struct {
@@ -357,10 +362,50 @@ func generate(n int, seed int64, now time.Time) []*sim {
 		b.addFixture(f)
 	}
 	b.addSynthetic(n - len(b.sims))
+	b.pickRunners(30)
+	b.recentListings(60, 15)
 	return b.sims
 }
 
+// recentListings re-dates k synthetic assets into the last 30 days, the
+// first within7 of them into the last 7 days, so the new-listings and
+// discovery endpoints have fresh assets to work with.
+func (b *builder) recentListings(k, within7 int) {
+	var cands []*sim
+	for _, s := range b.sims {
+		if s.c.synthetic {
+			cands = append(cands, s)
+		}
+	}
+	for i, s := range cands[:min(k, len(cands))] {
+		var days float64
+		if i < within7 {
+			days = b.rng.Float64() * 7
+		} else {
+			days = 7 + b.rng.Float64()*23
+		}
+		s.c.dateAdded = b.now.Add(-time.Duration(days * float64(24*time.Hour)))
+	}
+}
+
+// pickRunners marks mid-cap assets that trend up strongly: their market
+// cap and volume grow over hours, so their rank climbs.
+func (b *builder) pickRunners(n int) {
+	var cands []*sim
+	for _, s := range b.sims {
+		mcap := s.price * s.c.circulating
+		if s.c.ranked && !s.stable && s.peg == nil && mcap > 5e5 && mcap < 2e8 {
+			cands = append(cands, s)
+		}
+	}
+	for _, i := range b.rng.Perm(len(cands))[:min(n, len(cands))] {
+		cands[i].runner = true
+		cands[i].runRate = 0.15 + 0.25*b.rng.Float64()
+	}
+}
+
 func (b *builder) add(s *sim) {
+	s.phase = b.rng.Float64() * 2 * math.Pi
 	c := s.c
 	if _, dup := b.byID[c.id]; dup {
 		panic(fmt.Sprintf("cmcfake: duplicate id %d", c.id))
@@ -426,6 +471,9 @@ func (b *builder) addFixture(f fixture) {
 		price = peg.price * (1 + 0.001*b.rng.NormFloat64())
 	}
 	s := &sim{c: c, price: price, basePrice: price, sigma: 0.004, stable: f.stable, peg: peg}
+	if peg != nil {
+		s.pegRatio = price / peg.price
+	}
 	if f.rank > 0 {
 		c.circulating = marketCapAt(float64(f.rank)) / price
 		c.total = c.circulating * (1 + 0.3*b.rng.Float64())
@@ -462,7 +510,7 @@ func (b *builder) addSynthetic(count int) {
 		rankTarget := float64(slots[i] + 1 + len(realAssets))
 		name, symbol, slug := b.identity()
 		c := &coin{
-			id: id, name: name, symbol: symbol, slug: slug,
+			id: id, name: name, symbol: symbol, slug: slug, synthetic: true,
 			ranked: !(rankTarget > 300 && b.rng.Float64() < 0.03),
 		}
 		if b.rng.Float64() < 0.7 {

@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: coinstack
+    runtime: docker
+    plan: starter
+    healthCheckPath: /v1/health
+    envVars:
+      - key: CMC_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: coinstack-db
+          property: connectionString
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_IDS
+        sync: false
+
+databases:
+  - name: coinstack-db
+    plan: basic-256mb

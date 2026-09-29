@@ -1,7 +1,7 @@
-// Package cache holds the latest published market snapshot. The poller
+// snapshot.go holds the latest published market snapshot. The poller
 // builds a new Snapshot and publishes it with one atomic pointer swap, so
 // HTTP handlers read without locks and never see a half-built snapshot.
-package cache
+package market
 
 import (
 	"sort"

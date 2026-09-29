@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fozagtx/coinstack/internal/cache"
 	"github.com/fozagtx/coinstack/internal/model"
 )
 
@@ -101,9 +100,13 @@ func (m *Market) poll(ctx context.Context, all bool) error {
 		m.lastError = err.Error()
 	}
 	var merged []model.Quote
+	var snap *Snapshot
 	if failed < len(results) {
 		merged = m.mergeLocked(now, dropped)
-		m.store.Publish(cache.NewSnapshot(merged, now))
+		snap = NewSnapshot(merged, now)
+		m.store.Publish(snap)
+		m.recordHistoryLocked(now, merged)
+		m.notifySubsLocked(snap)
 		m.published = true
 		if failed == 0 {
 			m.lastSuccessAt = now
@@ -258,7 +261,7 @@ func (m *Market) Seed(quotes []model.Quote) {
 	if len(quotes) == 0 {
 		return
 	}
-	snap := cache.NewSnapshot(quotes, m.now())
+	snap := NewSnapshot(quotes, m.now())
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.published {
@@ -268,6 +271,8 @@ func (m *Market) Seed(quotes []model.Quote) {
 		return
 	}
 	m.store.Publish(snap)
+	m.recordHistoryLocked(snap.PublishedAt, quotes)
+	m.notifySubsLocked(snap)
 	for i := range m.pages {
 		m.pages[i].quotes = nil
 	}

@@ -41,10 +41,6 @@ type Upstream interface {
 	// from /v1/cryptocurrency/listings/new.
 	ListingsNew(ctx context.Context, start, limit int) ([]model.Quote, Meta, error)
 
-	// FiatRates returns how many units of each currency equal 1 USD, from
-	// /v2/tools/price-conversion. Currencies CMC does not know are omitted.
-	FiatRates(ctx context.Context, currencies []string) (map[string]float64, Meta, error)
-
 	// KeyInfo returns plan limits and credit usage from /v1/key/info
 	// (this call does not consume credits).
 	KeyInfo(ctx context.Context) (model.KeyUsage, error)

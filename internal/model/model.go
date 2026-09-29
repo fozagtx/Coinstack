@@ -74,10 +74,21 @@ type KeyUsage struct {
 	FetchedAt               time.Time
 }
 
+// Sample is one point of an asset's history: rank, price, market cap and
+// volume as of At. The market layer keeps an hourly ring per asset, the
+// store rebuilds it from persisted snapshots.
+type Sample struct {
+	At        time.Time
+	Rank      int
+	Price     float64
+	MarketCap float64
+	Volume24h float64
+}
+
 // PollRun records one upstream call made by the poller, for poll_runs
 // history, credit accounting and /v1/health.
 type PollRun struct {
-	Kind          string // "listings", "quotes", "map", "info", "new", "fx", "keyinfo"
+	Kind          string // "listings", "quotes", "map", "info", "new", "keyinfo"
 	StartedAt     time.Time
 	FinishedAt    time.Time
 	OK            bool
@@ -102,6 +113,11 @@ type MarketStatus struct {
 	UpstreamCalls      int64
 	UpstreamErrors     int64
 	MapFetchedAt       time.Time // last successful resolver-map refresh
+	HistoryAssets      int       // assets with at least one history sample
+	HistoryHours       int       // age in hours of the oldest retained sample
+	// ProjectedCreditsPerDay is the configured schedule's projected daily
+	// CMC credit burn; informational only.
+	ProjectedCreditsPerDay int
 }
 
 // Candidate is a short description of an asset, returned to agents when a

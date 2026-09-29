@@ -182,6 +182,44 @@ func (s *Store) LoadLatestSnapshot(ctx context.Context, maxAge time.Duration) ([
 	return out, nil
 }
 
+// LoadHistory rebuilds per-asset history rings from persisted snapshots:
+// one sample per (cmc_id, hour bucket), the latest row of each bucket,
+// within window, ordered oldest first.
+func (s *Store) LoadHistory(ctx context.Context, window time.Duration) (map[int64][]model.Sample, error) {
+	since := time.Unix(0, 0)
+	if window > 0 {
+		since = s.now().Add(-window)
+	}
+	out := map[int64][]model.Sample{}
+	err := s.pool.withConn(ctx, func(c *pgx.Conn) error {
+		rows, err := c.Query(ctx, `
+			SELECT DISTINCT ON (cmc_id, date_trunc('hour', fetched_at))
+				cmc_id, COALESCE(rank, 0), price, market_cap, volume_24h, fetched_at
+			FROM snapshots
+			WHERE fetched_at >= $1::timestamptz
+			ORDER BY cmc_id, date_trunc('hour', fetched_at), fetched_at DESC`, since)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var sm model.Sample
+			var id int64
+			var at time.Time
+			if err := rows.Scan(&id, &sm.Rank, &sm.Price, &sm.MarketCap, &sm.Volume24h, &at); err != nil {
+				return err
+			}
+			sm.At = at.UTC()
+			out[id] = append(out[id], sm)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: load history: %w", err)
+	}
+	return out, nil
+}
+
 // SaveMap upserts CMC's id map into assets and marks every asset absent from
 // entries inactive, in one transaction, then records fetchedAt as the map's
 // age. The ~10-30k rows are bulk-loaded with COPY into a temporary table.

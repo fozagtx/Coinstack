@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fozagtx/coinstack/internal/cache"
 	"github.com/fozagtx/coinstack/internal/cmc"
 	"github.com/fozagtx/coinstack/internal/model"
 )
@@ -18,12 +17,10 @@ import (
 // marketAPI mirrors api.Market (internal/api/deps.go). The api package is
 // not imported so these tests do not depend on the HTTP layer compiling.
 type marketAPI interface {
-	Snapshot() *cache.Snapshot
+	Snapshot() *Snapshot
 	Quotes(ctx context.Context, ids []int64) (map[int64]model.Quote, error)
 	Info(ctx context.Context, ids []int64) (map[int64]model.Info, error)
 	NewListings(ctx context.Context, days int) ([]model.Quote, error)
-	FXRate(currency string) (rate float64, asOf time.Time, ok bool)
-	Currencies() []string
 	Status() model.MarketStatus
 }
 
@@ -62,7 +59,6 @@ type fakeUp struct {
 	infos     map[int64]model.Info
 	mapList   []model.MapEntry
 	newList   []model.Quote
-	rates     map[string]float64
 	key       model.KeyUsage
 	credits   int
 	delay     time.Duration // latency of QuotesLatest and Info
@@ -71,7 +67,6 @@ type fakeUp struct {
 	errInfo   error
 	errMap    error
 	errNew    error
-	errFX     error
 	errKey    error
 
 	calls    map[string]int
@@ -190,22 +185,6 @@ func (f *fakeUp) ListingsNew(ctx context.Context, start, limit int) ([]model.Quo
 		return nil, cmc.Meta{}, f.errNew
 	}
 	return append([]model.Quote(nil), f.newList...), f.meta(), nil
-}
-
-func (f *fakeUp) FiatRates(ctx context.Context, currencies []string) (map[string]float64, cmc.Meta, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls["fx"]++
-	if f.errFX != nil {
-		return nil, cmc.Meta{}, f.errFX
-	}
-	out := map[string]float64{}
-	for _, c := range currencies {
-		if r, ok := f.rates[c]; ok {
-			out[c] = r
-		}
-	}
-	return out, f.meta(), nil
 }
 
 func (f *fakeUp) KeyInfo(ctx context.Context) (model.KeyUsage, error) {
@@ -329,7 +308,7 @@ func newEnv(t *testing.T, tweak func(*Config)) *env {
 	return &env{clk: clk, up: up, rec: rec, m: New(up, cfg)}
 }
 
-func snapshotIDs(s *cache.Snapshot) []int64 {
+func snapshotIDs(s *Snapshot) []int64 {
 	ids := make([]int64, 0, s.Len())
 	for _, q := range s.ByRank {
 		ids = append(ids, q.ID)
@@ -343,4 +322,50 @@ func universeOf(qs ...model.Quote) map[int64]model.Quote {
 		m[q.ID] = q
 	}
 	return maps.Clone(m)
+}
+
+func TestPollOncePublishesSnapshotAndHistory(t *testing.T) {
+	e := newEnv(t, func(c *Config) {
+		c.TopN = 4
+		c.PageSize = 2
+		c.HistoryBucket = time.Hour
+	})
+	e.up.ranked = assets(4, t0)
+	if err := e.m.PollOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snap := e.m.Snapshot()
+	if snap.Len() != 4 {
+		t.Fatalf("snapshot has %d assets", snap.Len())
+	}
+	if got := snapshotIDs(snap); got[0] != 1001 || got[3] != 1004 {
+		t.Fatalf("order = %v", got)
+	}
+	if h := e.m.History(1001); len(h) != 1 || h[0].Rank != 1 {
+		t.Fatalf("history = %+v", h)
+	}
+	if s, ok := e.m.RankAt(1001, 0); !ok || s.Rank != 1 {
+		t.Fatalf("RankAt = %+v, %v", s, ok)
+	}
+
+	// A second poll inside the same bucket adds no sample; after advancing
+	// past the bucket it does.
+	e.clk.Advance(30 * time.Minute)
+	if err := e.m.PollOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if h := e.m.History(1001); len(h) != 1 {
+		t.Fatalf("history len = %d", len(h))
+	}
+	e.clk.Advance(31 * time.Minute)
+	e.up.ranked = restamp(e.up.ranked, e.clk.Now())
+	if err := e.m.PollOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if h := e.m.History(1001); len(h) != 2 {
+		t.Fatalf("history len = %d", len(h))
+	}
+	if st := e.m.Status(); st.HistoryAssets != 4 || st.HistoryHours != 1 {
+		t.Fatalf("status history = %d assets, %d hours", st.HistoryAssets, st.HistoryHours)
+	}
 }

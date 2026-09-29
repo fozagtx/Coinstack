@@ -15,17 +15,68 @@ func TestDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Port != "8080" || c.TopN != 500 || c.FastN != 500 || c.PageSize != 200 {
+	if c.Preset != "startup" || c.TopN != 3000 || c.FastN != 200 || c.PageSize != 1000 {
 		t.Fatalf("bad defaults: %+v", c)
 	}
-	if c.PollInterval != time.Minute || c.StaleAfter != 3*time.Minute || c.MaxStale != 30*time.Minute {
+	if c.PollInterval != 2*time.Minute || c.SlowInterval != 15*time.Minute || c.StaleAfter != 3*time.Minute {
 		t.Fatalf("bad durations: %+v", c)
 	}
 	if !c.AuthEnabled || c.CMCBaseURL != DefaultCMCBaseURL {
 		t.Fatalf("bad auth/base: %+v", c)
 	}
-	if strings.Join(c.Currencies, ",") != "EUR,GBP,JPY" {
-		t.Fatalf("currencies = %v", c.Currencies)
+}
+
+func TestPresets(t *testing.T) {
+	base := map[string]string{"CMC_API_KEY": "k", "COINSTACK_API_KEYS": "secret-key-1"}
+	cases := []struct {
+		preset      string
+		topN, fastN int
+		poll, slow  time.Duration
+	}{
+		{"free", 1000, 200, 10 * time.Minute, 30 * time.Minute},
+		{"startup", 3000, 200, 2 * time.Minute, 15 * time.Minute},
+		{"standard", 5000, 500, time.Minute, 10 * time.Minute},
+	}
+	for _, tc := range cases {
+		m := map[string]string{}
+		for k, v := range base {
+			m[k] = v
+		}
+		m["COINSTACK_PRESET"] = tc.preset
+		c, err := Load(env(m))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.preset, err)
+		}
+		if c.TopN != tc.topN || c.FastN != tc.fastN || c.PollInterval != tc.poll || c.SlowInterval != tc.slow {
+			t.Fatalf("%s: got %+v", tc.preset, c)
+		}
+	}
+	// An explicit env var overrides its preset default.
+	m := map[string]string{}
+	for k, v := range base {
+		m[k] = v
+	}
+	m["COINSTACK_PRESET"] = "free"
+	m["COINSTACK_TOP_N"] = "2500"
+	c, err := Load(env(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TopN != 2500 || c.PollInterval != 10*time.Minute {
+		t.Fatalf("override got %+v", c)
+	}
+	// Unknown presets are rejected.
+	m["COINSTACK_PRESET"] = "whale"
+	if _, err := Load(env(m)); err == nil || !strings.Contains(err.Error(), "COINSTACK_PRESET") {
+		t.Fatalf("want preset error, got %v", err)
+	}
+}
+
+func TestProjectedCreditsPerDay(t *testing.T) {
+	c := Config{TopN: 3000, FastN: 200, PollInterval: 2 * time.Minute, SlowInterval: 15 * time.Minute}
+	want := 1*(86400/120) + 14*(86400/900) + 50 // 720 + 1344 + 50
+	if got := c.ProjectedCreditsPerDay(); got != want {
+		t.Fatalf("got %d, want %d", got, want)
 	}
 }
 
@@ -36,7 +87,6 @@ func TestParsesOverrides(t *testing.T) {
 		"COINSTACK_TOP_N":         "300",
 		"COINSTACK_FAST_N":        "900",
 		"COINSTACK_POLL_INTERVAL": "30",
-		"COINSTACK_CURRENCIES":    "eur, usd, eur ,chf",
 		"COINSTACK_API_KEYS":      "abcdefgh:alice:120, ijklmnop",
 		"LOG_LEVEL":               "debug",
 	}))
@@ -48,9 +98,6 @@ func TestParsesOverrides(t *testing.T) {
 	}
 	if c.PollInterval != 30*time.Second {
 		t.Fatalf("poll = %s", c.PollInterval)
-	}
-	if strings.Join(c.Currencies, ",") != "EUR,CHF" {
-		t.Fatalf("currencies = %v", c.Currencies)
 	}
 	if len(c.StaticKeys) != 2 || c.StaticKeys[0].Owner != "alice" || c.StaticKeys[0].RateLimit != 120 || c.StaticKeys[1].Owner != "static" {
 		t.Fatalf("keys = %+v", c.StaticKeys)

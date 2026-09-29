@@ -11,19 +11,22 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+
+	"github.com/fozagtx/coinstack/internal/discover"
 )
 
 // Route paths served by the API.
 const (
-	pathDocs      = "/"
-	pathPrice     = "/v1/price"
-	pathAsset     = "/v1/asset"
-	pathCompare   = "/v1/compare"
-	pathMovers    = "/v1/movers"
-	pathNewTokens = "/v1/new-tokens"
-	pathResolve   = "/v1/resolve"
-	pathOpenAPI   = "/v1/openapi.json"
-	pathHealth    = "/v1/health"
+	pathDocs        = "/"
+	pathGems        = "/v1/gems"
+	pathScreen      = "/v1/screen"
+	pathClimbers    = "/v1/climbers"
+	pathNewListings = "/v1/new-listings"
+	pathSectors     = "/v1/sectors"
+	pathAsset       = "/v1/asset"
+	pathResolve     = "/v1/resolve"
+	pathOpenAPI     = "/v1/openapi.json"
+	pathHealth      = "/v1/health"
 )
 
 // Config tunes the HTTP layer. Zero values get the documented defaults.
@@ -41,6 +44,10 @@ type Config struct {
 	MaxStale time.Duration
 	// TopN is the size of the top-N cache, shown in the docs and health.
 	TopN int
+	// Preset is the polling preset name, shown in /v1/health.
+	Preset string
+	// Telegram, when non-nil, reports bot status on /v1/health.
+	Telegram func() TelegramStatus
 	// AuthDisabled turns off API-key checks and rate limiting. For local
 	// development only; Keys may be nil then.
 	AuthDisabled bool
@@ -51,10 +58,19 @@ type Config struct {
 	Logger *slog.Logger
 }
 
+// TelegramStatus is the bot summary /v1/health reports.
+type TelegramStatus struct {
+	Enabled      bool       `json:"enabled"`
+	Chats        int        `json:"chats"`
+	LastUpdateAt *time.Time `json:"last_update_at"`
+	AlertsSent   int64      `json:"alerts_sent"`
+}
+
 // Server is the CoinStack HTTP API. Create one with New and serve its
 // Handler. It is safe for concurrent use.
 type Server struct {
 	cfg      Config
+	engine   *discover.Engine
 	market   Market
 	resolver Resolver
 	keys     Keys
@@ -64,8 +80,9 @@ type Server struct {
 	limiter  *keyLimiter
 	metrics  *metrics
 	reqIDs   *requestIDs
-	openapi  openAPIDoc
-	docs     docsPage
+	openapi  []byte
+	openETag string
+	docs     []byte
 	router   chi.Router
 }
 
@@ -111,8 +128,10 @@ func New(cfg Config, m Market, r Resolver, keys Keys, reqlog RequestLogger) *Ser
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	doc, etag := buildOpenAPI(cfg.Version)
 	s := &Server{
 		cfg:      cfg,
+		engine:   discover.New(m, r, cfg.Now),
 		market:   m,
 		resolver: r,
 		keys:     keys,
@@ -121,8 +140,9 @@ func New(cfg Config, m Market, r Resolver, keys Keys, reqlog RequestLogger) *Ser
 		started:  cfg.Now(),
 		limiter:  newKeyLimiter(10000, 15*time.Minute),
 		reqIDs:   newRequestIDs(),
-		openapi:  newOpenAPIDoc(),
-		docs:     newDocsPage(cfg.Version, cfg.TopN),
+		openapi:  doc,
+		openETag: etag,
+		docs:     buildDocsPage(cfg.Version, cfg.TopN),
 	}
 	routes := s.routes()
 	names := make([]string, 0, len(routes))
@@ -142,11 +162,12 @@ func (s *Server) routes() []route {
 		{path: pathDocs, public: true, handler: s.handleDocs},
 		{path: pathOpenAPI, public: true, handler: s.handleOpenAPI},
 		{path: pathHealth, public: true, handler: s.handleHealth},
-		{path: pathPrice, handler: s.handlePrice},
+		{path: pathGems, handler: s.handleGems},
+		{path: pathScreen, handler: s.handleScreen},
+		{path: pathClimbers, handler: s.handleClimbers},
+		{path: pathNewListings, handler: s.handleNewListings},
+		{path: pathSectors, handler: s.handleSectors},
 		{path: pathAsset, handler: s.handleAsset},
-		{path: pathCompare, handler: s.handleCompare},
-		{path: pathMovers, handler: s.handleMovers},
-		{path: pathNewTokens, handler: s.handleNewTokens},
 		{path: pathResolve, handler: s.handleResolve},
 	}
 }
@@ -188,7 +209,7 @@ func (s *Server) topN() int {
 
 func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) *apiError {
 	return newError(http.StatusNotFound, codeNotFound, "No endpoint at this path.",
-		"Use one of /v1/price, /v1/asset, /v1/compare, /v1/movers, /v1/new-tokens or /v1/resolve; GET /v1/openapi.json describes them all.")
+		"Use one of /v1/gems, /v1/screen, /v1/climbers, /v1/new-listings, /v1/sectors, /v1/asset or /v1/resolve; GET /v1/openapi.json describes them all.")
 }
 
 func (s *Server) handleMethodNotAllowed(w http.ResponseWriter, r *http.Request) *apiError {

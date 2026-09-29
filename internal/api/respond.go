@@ -16,10 +16,14 @@ import (
 // source is the value of every envelope's "source" field.
 const source = "coinmarketcap"
 
+// disclaimer rides on every discovery endpoint's envelope.
+const disclaimer = "Market data for information only, not financial advice."
+
 // Error codes, as listed in docs/api-contract.md.
 const (
 	codeAmbiguous        = "ambiguous_asset"
 	codeAssetNotFound    = "asset_not_found"
+	codeSectorNotFound   = "sector_not_found"
 	codeUpstream         = "upstream_unavailable"
 	codeBudget           = "upstream_budget_exhausted"
 	codeInvalidParam     = "invalid_parameter"
@@ -32,9 +36,10 @@ const (
 
 // Warning codes.
 const (
-	warnStale      = "stale_data"
-	warnByRank     = "symbol_resolved_by_rank"
-	warnOutsideTop = "outside_top_n"
+	warnStale        = "stale_data"
+	warnByRank       = "symbol_resolved_by_rank"
+	warnOutsideTop   = "outside_top_n"
+	warnShortHistory = "insufficient_history"
 )
 
 // defaultRetryAfter is suggested to agents when upstream gives no hint.
@@ -42,12 +47,15 @@ const defaultRetryAfter = 30 * time.Second
 
 // envelope is the success shape shared by the data endpoints.
 type envelope struct {
-	AsOf       string    `json:"as_of"`
-	AgeSeconds int64     `json:"age_seconds"`
-	Source     string    `json:"source"`
-	Currency   string    `json:"currency"`
-	Data       any       `json:"data"`
-	Warnings   []warning `json:"warnings,omitempty"`
+	AsOf       string `json:"as_of"`
+	AgeSeconds int64  `json:"age_seconds"`
+	Source     string `json:"source"`
+	Note       string `json:"note,omitempty"`
+	// HistoryHours is the depth of retained history; a pointer so 0 is
+	// emitted (the ring is still warming up) while nil omits the field.
+	HistoryHours *int      `json:"history_hours,omitempty"`
+	Data         any       `json:"data"`
+	Warnings     []warning `json:"warnings,omitempty"`
 }
 
 // warning is one entry of an envelope's "warnings" array.
@@ -79,7 +87,6 @@ type errorResponse struct {
 	AsOf       string       `json:"as_of,omitempty"`
 	AgeSeconds *int64       `json:"age_seconds,omitempty"`
 	Source     string       `json:"source,omitempty"`
-	Currency   string       `json:"currency,omitempty"`
 	Data       any          `json:"data,omitempty"`
 }
 
@@ -92,9 +99,8 @@ type apiError struct {
 
 // staleData is older data served alongside a 503 upstream_unavailable.
 type staleData struct {
-	asOf     time.Time
-	currency string
-	data     any
+	asOf time.Time
+	data any
 }
 
 func (e *apiError) Error() string { return e.detail.Code + ": " + e.detail.Message }
@@ -143,7 +149,7 @@ func (s *Server) respond(w http.ResponseWriter, env *envelope, asOf time.Time, e
 			"CoinMarketCap data has not refreshed: the newest data available is %d s old, past the %d s limit.",
 			age, int64(s.cfg.MaxStale/time.Second)), defaultRetryAfter)
 		e.detail.NextStep = fmt.Sprintf("Retry in %d seconds; use the attached data only if its age is acceptable.", e.detail.RetryAfterSeconds)
-		e.stale = &staleData{asOf: asOf, currency: env.Currency, data: env.Data}
+		e.stale = &staleData{asOf: asOf, data: env.Data}
 		return e
 	}
 	env.AsOf = formatTime(asOf)
@@ -170,7 +176,6 @@ func (s *Server) writeError(w http.ResponseWriter, e *apiError) {
 		body.AsOf = formatTime(asOf)
 		body.AgeSeconds = &age
 		body.Source = source
-		body.Currency = e.stale.currency
 		body.Data = e.stale.data
 	}
 	if e.detail.RetryAfterSeconds > 0 {
